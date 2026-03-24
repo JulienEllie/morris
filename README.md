@@ -5,8 +5,7 @@
 *Find the bugs hiding in your test suite*
 
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
-[![AWS Bedrock](https://img.shields.io/badge/AWS-Bedrock-FF9900.svg)](https://aws.amazon.com/bedrock/)
-[![Claude](https://img.shields.io/badge/Claude-Sonnet%204.6-8A2BE2.svg)](https://www.anthropic.com/claude)
+[![Claude Code](https://img.shields.io/badge/Claude%20Code-skill-8A2BE2.svg)](https://claude.com/claude-code)
 
 ```
     ╔═══════════════════════════════════════╗
@@ -16,11 +15,23 @@
 
 ---
 
+## Changes from the original
+
+This is a fork of [Marc Brooker's morris](https://github.com/mbrooker/morris). Key differences:
+
+- **Claude Code skill instead of Bedrock** — the original used AWS Bedrock for AI reasoning; this fork uses a Claude Code `/morris` skill, so no API keys or AWS setup needed
+- **Markdown + YAML output** — `cargo morris discover` outputs markdown with YAML frontmatter and fenced code blocks instead of a single-line JSON blob with escaped newlines
+- **Diff-style mutation input** — mutation plans use a `## file:line` / `- original` / `+ mutated` format instead of JSON, which is less error-prone for LLMs to generate
+- **File/directory targeting** — you can run morris on specific files or directories (`/morris src/lib.rs`)
+- **Dropped serde/serde_json dependencies** — the simpler text formats eliminated the need for JSON serialization
+
+---
+
 ## 🎯 What is Morris?
 
-Morris is a cargo subcommand that uses **AWS Bedrock (Claude Sonnet 4.6)** to perform intelligent mutation testing on Rust projects. Instead of exhaustively testing thousands of mutations, Morris uses AI to strategically select 5-8 high-value mutations that are most likely to reveal gaps in your test coverage.
+Morris is a [Claude Code](https://claude.com/claude-code) skill that performs intelligent mutation testing on Rust projects. Instead of exhaustively testing thousands of mutations, Morris uses AI to strategically select 5-8 high-value mutations that are most likely to reveal gaps in your test coverage.
 
-Morris follows a **fixed workflow** — file discovery, test execution, and mutation application are all handled by deterministic code. The AI is used only for two targeted tasks: selecting which mutations to try, and analyzing the results.
+Morris splits work between **deterministic code** (file discovery, test execution, mutation application) and **AI reasoning** (selecting mutations, analyzing results). The deterministic parts run as a cargo subcommand. The AI parts are handled by Claude Code — no API key required if you have a Claude subscription.
 
 ```
 ┌─────────────┐      ┌──────────────┐      ┌─────────────┐
@@ -30,41 +41,53 @@ Morris follows a **fixed workflow** — file discovery, test execution, and muta
                             │
                             ├─ Discovers files (deterministic)
                             ├─ Runs baseline tests (deterministic)
-                            ├─ AI selects mutations (Bedrock)
+                            ├─ AI selects mutations (Claude Code)
                             ├─ Tests mutations (deterministic)
-                            └─ AI analyzes results (Bedrock)
+                            └─ AI analyzes results (Claude Code)
 ```
 
 ---
 
 ## 🚀 Quick Start
 
+### Prerequisites
+
+- [Claude Code](https://claude.com/claude-code) installed
+- A Rust project with tests
+
 ### Installation
 
 ```bash
-cargo install --path .
+# Install the cargo subcommand
+cargo install --git https://github.com/JulienEllie/morris
+
+# Install the Claude Code skill (global — works in any project)
+mkdir -p ~/.claude/skills
+cp -r .claude/skills/morris ~/.claude/skills/morris
 ```
 
-### Prerequisites
+### Usage
 
-- **AWS Bedrock** access with Claude Sonnet 4.6 enabled
-- AWS credentials configured (via `~/.aws/credentials` or environment variables)
-- A Rust project with tests
+In any Rust project, open Claude Code and type:
 
-### Basic Usage
-
-```bash
-cd your-rust-project
-cargo morris
+```
+/morris
 ```
 
-That's it! Morris will analyze your code and report surviving mutations.
+That's it! Claude will discover your source files, propose mutations, test them, and analyze the results.
+
+You can also target specific files or directories:
+
+```
+/morris src/lib.rs
+/morris src/parser/
+```
 
 ---
 
 ## 📋 How It Works
 
-Morris uses a fixed, deterministic workflow. The AI (via AWS Bedrock Converse API) is called exactly twice: once to propose mutations, and once to analyze results.
+Morris uses a fixed, deterministic workflow. Claude Code provides the AI reasoning, while the `cargo-morris` binary handles all file I/O, test execution, and mutation application.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -80,8 +103,8 @@ Morris uses a fixed, deterministic workflow. The AI (via AWS Bedrock Converse AP
 │  3. ⏱️  Baseline (deterministic)                             │
 │     └─ Runs `cargo test` to verify and measure timing      │
 │                                                             │
-│  4. 🧬 Mutation Plan (AI — Bedrock call #1)                 │
-│     └─ Claude proposes 5-8 strategic mutations as JSON     │
+│  4. 🧬 Mutation Plan (AI — Claude Code)                     │
+│     └─ Claude proposes 5-8 strategic mutations             │
 │        • Operators: > → <, + → -, == → !=                  │
 │        • Boundaries: 0 → 1, len() → len()-1                │
 │        • Logic: && → ||, true → false                      │
@@ -96,51 +119,35 @@ Morris uses a fixed, deterministic workflow. The AI (via AWS Bedrock Converse AP
 │  6. 📊 Results Summary (deterministic)                      │
 │     └─ Counts killed / survived / build errors             │
 │                                                             │
-│  7. 💡 Analysis (AI — Bedrock call #2)                      │
+│  7. 💡 Analysis (AI — Claude Code)                          │
 │     └─ Claude explains surviving mutations and             │
 │        suggests specific tests to catch them               │
-│                                                             │
-│  8. ✨ Auto Mode (optional, deterministic)                  │
-│     └─ Parses AI suggestions and writes improved tests     │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 🎛️ Command Line Options
+## 🎛️ CLI Subcommands
 
-| Flag | Description | Use Case |
-|------|-------------|----------|
-| *(none)* | Default mode with Claude Sonnet 4.6 | Best quality analysis |
-| `--quick` | Use Claude Haiku 4.5 | Faster, less thorough |
-| `--auto` | Automatically apply test improvements | Hands-free mode |
-| `-v` / `--verbose` | Enable debug logging | Troubleshooting |
+Morris exposes three subcommands used by the `/morris` skill. You don't normally call these directly, but they're available if you want to integrate Morris into other workflows.
 
-### Examples
+| Command | Description |
+|---------|-------------|
+| `cargo morris discover [paths...]` | Find source files, read them, run baseline tests. Outputs markdown. |
+| `cargo morris test --timeout <secs>` | Read mutation plan from stdin, test each mutation, output results. |
+| `cargo morris apply --timeout <secs>` | Read analysis text from stdin, auto-apply suggested tests. |
 
-```bash
-# Standard analysis (recommended)
-cargo morris
-
-# Quick analysis for rapid feedback
-cargo morris --quick
-
-# Auto-apply test improvements
-cargo morris --auto
-
-# Quick + auto for maximum speed
-cargo morris --quick --auto
-```
+All subcommands accept `-v` / `--verbose` for debug logging.
 
 ---
 
-## 📊 Example Output
+## 📊 Example Session
 
-```bash
-$ cargo morris
+```
+> /morris
 
-🧬 Morris v0.2.0 - AI-Powered Mutation Testing
+🧬 Morris v0.3.0 - Mutation Testing
 
 📁 Discovering source files...
    src/lib.rs
@@ -149,10 +156,9 @@ $ cargo morris
 ⏱️  Running baseline tests...
    ✅ Baseline passed in 1.2s (mutation timeout: 30.0s)
 
-🧬 Asking AI for mutation plan...
-   Got 6 mutations
+[Claude proposes 6 mutations...]
 
-🧪 Testing mutations...
+🧪 Testing 6 mutations...
 
    [1/1] src/lib.rs:42 - Change > to <... ❌ SURVIVED
    [2/2] src/lib.rs:67 - Change + to -... ❌ SURVIVED
@@ -163,9 +169,7 @@ $ cargo morris
 
 📊 Results: 2 killed, 3 survived out of 5 testable mutations
 
-💡 Analyzing surviving mutations...
-
-[AI analysis with specific test suggestions]
+[Claude analyzes surviving mutations and suggests specific tests...]
 ```
 
 ---
@@ -185,42 +189,27 @@ $ cargo morris
 - Fixed workflow, AI used only for selection & analysis
 - Selects 5-8 strategic mutations
 - Contextual explanations of why mutations survive
-- Auto-applies improvements
 - Best for: Interactive development, learning
+
+The biggest difference is that mutants is a lot more mature, and probably more useful in production code bases for now.
 
 ---
 
 ## 🔧 Configuration
 
-### AWS Credentials
-
-Morris requires AWS credentials with Bedrock access:
-
-```bash
-# Option 1: AWS CLI
-aws configure
-
-# Option 2: Environment variables
-export AWS_ACCESS_KEY_ID=your_key
-export AWS_SECRET_ACCESS_KEY=your_secret
-export AWS_REGION=us-east-1
-```
-
 ### Verbose Output
 
 ```bash
-# Enable debug logging
-cargo morris -v
-
-# Or via environment variable
-RUST_LOG=debug cargo morris
+# Pass -v to any subcommand for debug logging
+cargo morris discover -v
+cargo morris test -v --timeout 30
 ```
 
 ---
 
 ## 🏗️ Architecture
 
-Morris uses a fixed workflow with two targeted Bedrock Converse API calls. All file I/O, test execution, and mutation application is deterministic code — no agent loop or tool-use protocol.
+Morris separates deterministic operations from AI reasoning. The `cargo-morris` binary handles all file I/O, test execution, and mutation application. Claude Code provides the intelligence — no API keys or separate billing required.
 
 ```
 ┌──────────────────────────────────────────────────────────┐
@@ -228,32 +217,18 @@ Morris uses a fixed workflow with two targeted Bedrock Converse API calls. All f
 ├──────────────────────────────────────────────────────────┤
 │                                                          │
 │  ┌────────────┐                                         │
-│  │   CLI      │  cargo morris [--quick] [--auto] [-v]   │
+│  │ Claude Code│  /morris                                │
+│  │   Skill    │  (AI reasoning)                         │
 │  └─────┬──────┘                                         │
 │        │                                                 │
 │        v                                                 │
 │  ┌────────────────────────────────────────┐             │
-│  │        Fixed Workflow Engine            │             │
+│  │      cargo-morris (deterministic)      │             │
 │  │                                        │             │
-│  │  1. Discover .rs files (fs)            │             │
-│  │  2. Read source files (fs)             │             │
-│  │  3. Run baseline tests (cargo test)    │             │
-│  │  4. Get mutation plan ──────────────┐  │             │
-│  │  5. Test each mutation (cargo test) │  │             │
-│  │  6. Summarize results               │  │             │
-│  │  7. Get analysis ───────────────────┤  │             │
-│  │  8. Auto-apply (optional, fs)       │  │             │
-│  └─────────────────────────────────────┘  │             │
-│                                           │             │
-│                                           v             │
-│                              ┌─────────────────────┐    │
-│                              │  AWS Bedrock        │    │
-│                              │  Converse API       │    │
-│                              │  • Sonnet 4.6       │    │
-│                              │  • Haiku 4.5        │    │
-│                              │  (2 calls total)    │    │
-│                              └─────────────────────┘    │
+│  │  discover: find files, run baseline   │             │
+│  │  test: apply mutations, run tests     │             │
+│  │  apply: inject new tests, verify      │             │
+│  └────────────────────────────────────────┘             │
 │                                                          │
 └──────────────────────────────────────────────────────────┘
 ```
-

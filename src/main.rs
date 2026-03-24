@@ -1,22 +1,19 @@
 //! Morris - AI-Powered Mutation Testing for Rust
 //!
-//! A fixed-workflow mutation testing tool that uses AWS Bedrock (Claude) to
-//! intelligently select and analyze mutations, while handling file discovery,
-//! test execution, and mutation application deterministically.
+//! A deterministic mutation testing tool. AI reasoning (mutation planning and
+//! analysis) is provided externally by Claude Code via the `/morris` skill.
+//! This binary handles file discovery, test execution, mutation application,
+//! and result reporting.
 
-use aws_sdk_bedrockruntime::{
-    operation::converse::ConverseOutput,
-    types::{ContentBlock, ConversationRole, Message, SystemContentBlock},
-};
 use clap::Parser;
-use serde::Deserialize;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 
 /// A single mutation proposed by the AI.
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 struct Mutation {
     file_path: String,
     line_number: usize,
@@ -25,10 +22,75 @@ struct Mutation {
     description: String,
 }
 
-/// The AI's response containing proposed mutations.
-#[derive(Debug, Deserialize)]
-struct MutationPlan {
-    mutations: Vec<Mutation>,
+/// Parse a mutation plan from diff-style format.
+///
+/// ```text
+/// ## file:line description
+/// - original line
+/// + mutated line
+/// ```
+fn parse_mutation_plan(input: &str) -> Result<Vec<Mutation>, Box<dyn std::error::Error>> {
+    let mut mutations = Vec::new();
+    let mut file_path: Option<String> = None;
+    let mut line_number: Option<usize> = None;
+    let mut description: Option<String> = None;
+    let mut original: Option<String> = None;
+    let mut mutated: Option<String> = None;
+
+    for raw_line in input.lines() {
+        let line = raw_line.trim_end();
+        if let Some(header) = line.strip_prefix("## ") {
+            // Flush previous mutation if complete
+            if let (Some(fp), Some(ln), Some(desc), Some(orig), Some(mut_)) =
+                (&file_path, line_number, &description, &original, &mutated)
+            {
+                mutations.push(Mutation {
+                    file_path: fp.clone(),
+                    line_number: ln,
+                    original_line: orig.clone(),
+                    mutated_line: mut_.clone(),
+                    description: desc.clone(),
+                });
+            }
+            // Parse: file:line description
+            let (file_and_line, desc) = header
+                .split_once(' ')
+                .ok_or_else(|| format!("bad header (need file:line desc): {line}"))?;
+            let (fp, ln) = file_and_line
+                .rsplit_once(':')
+                .ok_or_else(|| format!("missing ':' in file:line: {file_and_line}"))?;
+            file_path = Some(fp.to_string());
+            line_number = Some(
+                ln.parse()
+                    .map_err(|_| format!("bad line number: {ln}"))?,
+            );
+            description = Some(desc.to_string());
+            original = None;
+            mutated = None;
+        } else if let Some(orig) = line.strip_prefix("- ") {
+            original = Some(orig.to_string());
+        } else if let Some(mut_) = line.strip_prefix("+ ") {
+            mutated = Some(mut_.to_string());
+        }
+    }
+
+    // Flush last mutation
+    if let (Some(fp), Some(ln), Some(desc), Some(orig), Some(mut_)) =
+        (file_path, line_number, description, original, mutated)
+    {
+        mutations.push(Mutation {
+            file_path: fp,
+            line_number: ln,
+            original_line: orig,
+            mutated_line: mut_,
+            description: desc,
+        });
+    }
+
+    if mutations.is_empty() {
+        return Err("no mutations found in input".into());
+    }
+    Ok(mutations)
 }
 
 /// Result of testing a single mutation.
@@ -65,31 +127,82 @@ impl std::fmt::Display for MutationOutcome {
 #[command(name = "cargo", bin_name = "cargo")]
 enum CargoCli {
     /// AI-powered mutation testing for Rust
-    Morris(Config),
+    Morris(MorrisArgs),
 }
 
-/// AI-powered mutation testing for Rust.
-#[derive(Debug, Default, Parser)]
-struct Config {
-    /// Automatically apply test improvements
-    #[arg(long = "auto")]
-    auto_mode: bool,
-    /// Use Claude Haiku for faster, less thorough analysis
-    #[arg(long = "quick")]
-    quick_mode: bool,
-    /// Enable debug logging
-    #[arg(short, long)]
-    verbose: bool,
+#[derive(Debug, Parser)]
+struct MorrisArgs {
+    #[command(subcommand)]
+    command: Command,
 }
 
-impl Config {
-    fn model_id(&self) -> &str {
-        if self.quick_mode {
-            "us.anthropic.claude-haiku-4-5-20251001-v1:0"
-        } else {
-            "us.anthropic.claude-sonnet-4-6"
-        }
+#[derive(Debug, Parser)]
+enum Command {
+    /// Discover source files, read them, and run baseline tests.
+    /// Outputs markdown with YAML frontmatter and fenced code blocks.
+    Discover {
+        /// Enable debug logging
+        #[arg(short, long)]
+        verbose: bool,
+        /// Source files or directories to test (default: all of src/)
+        #[arg()]
+        paths: Vec<PathBuf>,
+    },
+    /// Test mutations from a line-record plan provided on stdin.
+    /// Outputs a results summary.
+    Test {
+        /// Enable debug logging
+        #[arg(short, long)]
+        verbose: bool,
+        /// Test timeout in seconds
+        #[arg(long)]
+        timeout: f64,
+    },
+    /// Auto-apply test improvements from analysis text on stdin.
+    Apply {
+        /// Enable debug logging
+        #[arg(short, long)]
+        verbose: bool,
+        /// Test timeout in seconds
+        #[arg(long)]
+        timeout: f64,
+    },
+}
+
+/// Format discover output as markdown with YAML frontmatter.
+fn format_discover_output(
+    cwd: &Path,
+    source_files: &[PathBuf],
+    baseline_duration_secs: f64,
+    test_timeout_secs: f64,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use std::fmt::Write;
+    let mut out = String::new();
+
+    // YAML frontmatter
+    writeln!(out, "---")?;
+    writeln!(out, "baseline_duration_secs: {baseline_duration_secs:.1}")?;
+    writeln!(out, "test_timeout_secs: {test_timeout_secs:.1}")?;
+    writeln!(out, "source_files:")?;
+    for f in source_files {
+        let rel = f.strip_prefix(cwd).unwrap_or(f);
+        writeln!(out, "  - {}", rel.display())?;
     }
+    writeln!(out, "---")?;
+
+    // File contents as fenced code blocks
+    for path in source_files {
+        let relative = path.strip_prefix(cwd).unwrap_or(path);
+        let raw = std::fs::read_to_string(path)?;
+        writeln!(out, "\n## {}", relative.display())?;
+        writeln!(out, "```rust")?;
+        for (i, line) in raw.lines().enumerate() {
+            writeln!(out, "{:>4}| {line}", i + 1)?;
+        }
+        writeln!(out, "```")?;
+    }
+
+    Ok(out)
 }
 
 /// Discover all `.rs` files under `src/` recursively.
@@ -116,6 +229,34 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
             out.push(path);
         }
     }
+}
+
+/// Resolve user-provided paths into a sorted list of `.rs` files.
+fn filter_source_files(
+    cwd: &Path,
+    paths: &[PathBuf],
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let mut files = Vec::new();
+    for p in paths {
+        let abs = if p.is_absolute() {
+            p.clone()
+        } else {
+            cwd.join(p)
+        };
+        let abs = abs
+            .canonicalize()
+            .map_err(|e| format!("{}: {e}", p.display()))?;
+        if abs.is_dir() {
+            collect_rs_files(&abs, &mut files);
+        } else if abs.extension().and_then(|s| s.to_str()) == Some("rs") {
+            files.push(abs);
+        } else {
+            return Err(format!("{}: not a .rs file or directory", p.display()).into());
+        }
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
 }
 
 /// Run `cargo test --quiet` and return (success, duration, output).
@@ -216,7 +357,7 @@ async fn test_line_mutation(
     }
 }
 
-/// Find the target line index (1-based), with fuzzy search ±5 lines.
+/// Find the target line index (1-based), with fuzzy search ±10 lines.
 fn find_target_line(lines: &[&str], line_number: usize, expected: &str) -> Option<usize> {
     if line_number == 0 || line_number > lines.len() {
         return None;
@@ -254,37 +395,6 @@ fn strip_code_fences(text: &str) -> &str {
     }
 }
 
-/// Call Bedrock Converse API and extract the text response.
-async fn converse(
-    client: &aws_sdk_bedrockruntime::Client,
-    model_id: &str,
-    system: &str,
-    user_message: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let resp: ConverseOutput = client
-        .converse()
-        .model_id(model_id)
-        .system(SystemContentBlock::Text(system.to_string()))
-        .messages(
-            Message::builder()
-                .role(ConversationRole::User)
-                .content(ContentBlock::Text(user_message.to_string()))
-                .build()
-                .map_err(|e| format!("Failed to build message: {e}"))?,
-        )
-        .send()
-        .await?;
-
-    let output = resp.output().ok_or("No output in response")?;
-    let message = output.as_message().map_err(|_| "Output is not a message")?;
-    for block in message.content() {
-        if let ContentBlock::Text(text) = block {
-            return Ok(text.clone());
-        }
-    }
-    Err("No text in response".into())
-}
-
 fn init_logging(verbose: bool) {
     let level = if verbose { "debug" } else { "warn" };
     tracing_subscriber::fmt()
@@ -292,53 +402,6 @@ fn init_logging(verbose: bool) {
             EnvFilter::from_default_env().add_directive(format!("morris={level}").parse().unwrap()),
         )
         .init();
-}
-
-/// Read all source files into a single string for the AI prompt.
-fn read_all_sources(
-    cwd: &Path,
-    source_files: &[PathBuf],
-) -> Result<String, Box<dyn std::error::Error>> {
-    use std::fmt::Write;
-    let mut contents = String::new();
-    for path in source_files {
-        let relative = path.strip_prefix(cwd).unwrap_or(path);
-        let raw = std::fs::read_to_string(path)?;
-        writeln!(contents, "=== {} ===", relative.display())?;
-        for (i, line) in raw.lines().enumerate() {
-            writeln!(contents, "{:>4}| {line}", i + 1)?;
-        }
-        contents.push('\n');
-    }
-    Ok(contents)
-}
-
-/// Build the prompt asking the AI for a mutation plan.
-fn build_mutation_prompt(file_contents: &str) -> String {
-    format!(
-        "Analyze this Rust project and propose 5-8 strategic single-line mutations that are \
-         likely to survive the existing test suite (i.e., reveal test coverage gaps).\n\n\
-         Focus on:\n\
-         - Boundary conditions (>, <, >=, <=)\n\
-         - Arithmetic operators (+, -, *, /)\n\
-         - Logic operators (&&, ||, !, ==, !=)\n\
-         - Off-by-one errors\n\
-         - Return value changes\n\n\
-         Respond with ONLY a JSON object (no markdown fences) in this exact format:\n\
-         {{\"mutations\": [\n\
-           {{\"file_path\": \"src/lib.rs\", \"line_number\": 42, \
-             \"original_line\": \"    if x > 0 {{\", \
-             \"mutated_line\": \"    if x >= 0 {{\", \
-             \"description\": \"Change > to >= to test boundary\"}}\n\
-         ]}}\n\n\
-         IMPORTANT:\n\
-         - Use paths relative to the project root\n\
-         - Line numbers are shown as \"  N| code\" — use the number before the pipe\n\
-         - Copy original_line EXACTLY as it appears AFTER the \"| \" prefix (including indentation)\n\
-         - Each mutation must be a single line change that still compiles\n\
-         - The mutated_line must have the same indentation as original_line\n\n\
-         Source files (with line numbers):\n{file_contents}"
-    )
 }
 
 /// Run all mutations and collect results.
@@ -403,33 +466,6 @@ fn format_results_summary(results: &[MutationResult]) -> String {
     summary
 }
 
-/// Build the analysis prompt based on mode.
-fn build_analysis_prompt(auto_mode: bool, results_summary: &str, file_contents: &str) -> String {
-    if auto_mode {
-        format!(
-            "Results:\n{results_summary}\n\n\
-             Source code:\n{file_contents}\n\n\
-             Write new #[test] functions that catch each SURVIVED mutation.\n\
-             Output ONLY the new test functions, nothing else. No explanations, no module wrapper, no use statements.\n\
-             Wrap them in a single fenced code block:\n\
-             ```rust\n\
-             #[test]\n\
-             fn test_name() {{ ... }}\n\
-             ```"
-        )
-    } else {
-        format!(
-            "These mutations were tested against the project's test suite.\n\n\
-             Results:\n{results_summary}\n\n\
-             Source code:\n{file_contents}\n\n\
-             For each SURVIVED mutation, explain:\n\
-             1. Why the current tests don't catch it\n\
-             2. A specific test that would catch it (show the code)\n\n\
-             Be concise and actionable."
-        )
-    }
-}
-
 /// Apply file changes from the AI analysis output.
 ///
 /// Extracts new test functions from the AI response and inserts them
@@ -444,7 +480,7 @@ async fn auto_apply(
     // Extract code from the first ```rust block (or bare ``` block)
     let new_tests = extract_code_block(analysis);
     if new_tests.is_empty() {
-        eprintln!("   ⚠️  No code block found in AI response");
+        eprintln!("   ⚠️  No code block found in input");
         return Ok(());
     }
 
@@ -503,123 +539,120 @@ fn extract_code_block(text: &str) -> String {
     code
 }
 
+/// Read all of stdin into a string.
+fn read_stdin() -> Result<String, Box<dyn std::error::Error>> {
+    let mut buf = String::new();
+    std::io::stdin().read_to_string(&mut buf)?;
+    Ok(buf)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let CargoCli::Morris(config) = CargoCli::parse();
-    init_logging(config.verbose);
+    let CargoCli::Morris(args) = CargoCli::parse();
 
-    eprintln!(
-        "🧬 Morris v{} - AI-Powered Mutation Testing\n",
-        env!("CARGO_PKG_VERSION")
-    );
+    match args.command {
+        Command::Discover { verbose, paths } => {
+            init_logging(verbose);
 
-    let cwd = std::env::current_dir()?;
-    let model_id = config.model_id();
+            eprintln!(
+                "🧬 Morris v{} - Mutation Testing\n",
+                env!("CARGO_PKG_VERSION")
+            );
 
-    // Step 1: Discover source files
-    eprintln!("📁 Discovering source files...");
-    let source_files = list_source_files(&cwd);
-    if source_files.is_empty() {
-        eprintln!("❌ No Rust source files found in src/");
-        return Ok(());
-    }
-    for f in &source_files {
-        eprintln!("   {}", f.display());
-    }
+            let cwd = std::env::current_dir()?;
 
-    // Step 2: Read all source files
-    eprintln!("\n📖 Reading source files...");
-    let file_contents = read_all_sources(&cwd, &source_files)?;
+            // Step 1: Discover source files
+            eprintln!("📁 Discovering source files...");
+            let source_files = if paths.is_empty() {
+                list_source_files(&cwd)
+            } else {
+                filter_source_files(&cwd, &paths)?
+            };
+            if source_files.is_empty() {
+                eprintln!("❌ No Rust source files found");
+                return Ok(());
+            }
+            for f in &source_files {
+                let rel = f.strip_prefix(&cwd).unwrap_or(f);
+                eprintln!("   {}", rel.display());
+            }
 
-    // Step 3: Run baseline tests
-    eprintln!("⏱️  Running baseline tests...");
-    let (baseline_ok, baseline_duration, baseline_output) =
-        run_cargo_test(Duration::from_secs(300)).await;
-    if !baseline_ok {
-        eprintln!("❌ Baseline tests failed! Fix your tests first.\n{baseline_output}");
-        return Ok(());
-    }
-    let test_timeout = baseline_duration.mul_f64(3.0).max(Duration::from_secs(30));
-    eprintln!(
-        "   ✅ Baseline passed in {:.1}s (mutation timeout: {:.1}s)",
-        baseline_duration.as_secs_f64(),
-        test_timeout.as_secs_f64()
-    );
+            // Step 2: Run baseline tests
+            eprintln!("⏱️  Running baseline tests...");
+            let (baseline_ok, baseline_duration, baseline_output) =
+                run_cargo_test(Duration::from_secs(300)).await;
+            if !baseline_ok {
+                eprintln!("❌ Baseline tests failed! Fix your tests first.\n{baseline_output}");
+                return Ok(());
+            }
+            let test_timeout = baseline_duration.mul_f64(3.0).max(Duration::from_secs(30));
+            eprintln!(
+                "   ✅ Baseline passed in {:.1}s (mutation timeout: {:.1}s)",
+                baseline_duration.as_secs_f64(),
+                test_timeout.as_secs_f64()
+            );
 
-    // Step 4: Ask AI for mutation plan
-    eprintln!("\n🧬 Asking AI for mutation plan...");
-    let aws_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-    let bedrock = aws_sdk_bedrockruntime::Client::new(&aws_config);
+            // Output markdown for the AI to consume
+            let output = format_discover_output(
+                &cwd,
+                &source_files,
+                baseline_duration.as_secs_f64(),
+                test_timeout.as_secs_f64(),
+            )?;
+            print!("{output}");
+        }
 
-    let plan_text = converse(
-        &bedrock,
-        model_id,
-        "You are a mutation testing expert for Rust. Respond only with valid JSON.",
-        &build_mutation_prompt(&file_contents),
-    )
-    .await?;
+        Command::Test { verbose, timeout } => {
+            init_logging(verbose);
 
-    debug!("AI mutation plan: {plan_text}");
+            let cwd = std::env::current_dir()?;
+            let test_timeout = Duration::from_secs_f64(timeout);
 
-    let plan: MutationPlan = serde_json::from_str(strip_code_fences(&plan_text))
-        .map_err(|e| format!("Failed to parse mutation plan: {e}\nRaw response:\n{plan_text}"))?;
+            // Read mutation plan from stdin (line-record format)
+            let input = read_stdin()?;
+            let mutations = parse_mutation_plan(strip_code_fences(&input))
+                .map_err(|e| format!("Failed to parse mutation plan: {e}\nRaw input:\n{input}"))?;
 
-    eprintln!("   Got {} mutations", plan.mutations.len());
+            eprintln!("🧪 Testing {} mutations...\n", mutations.len());
+            let results = run_mutations(&cwd, mutations, test_timeout).await;
 
-    // Step 5: Test each mutation
-    eprintln!("\n🧪 Testing mutations...\n");
-    let results = run_mutations(&cwd, plan.mutations, test_timeout).await;
+            // Summarize
+            let survived_count = results
+                .iter()
+                .filter(|r| matches!(r.outcome, MutationOutcome::Survived))
+                .count();
+            let killed = results
+                .iter()
+                .filter(|r| matches!(r.outcome, MutationOutcome::Killed))
+                .count();
+            let total_testable = results
+                .iter()
+                .filter(|r| {
+                    !matches!(
+                        r.outcome,
+                        MutationOutcome::BuildError(_) | MutationOutcome::LineMismatch(_)
+                    )
+                })
+                .count();
 
-    // Step 6: Summarize results
-    let survived_count = results
-        .iter()
-        .filter(|r| matches!(r.outcome, MutationOutcome::Survived))
-        .count();
-    let killed = results
-        .iter()
-        .filter(|r| matches!(r.outcome, MutationOutcome::Killed))
-        .count();
-    let total_testable = results
-        .iter()
-        .filter(|r| {
-            !matches!(
-                r.outcome,
-                MutationOutcome::BuildError(_) | MutationOutcome::LineMismatch(_)
-            )
-        })
-        .count();
+            eprintln!(
+                "\n📊 Results: {killed} killed, {survived_count} survived out of {total_testable} testable mutations"
+            );
 
-    eprintln!(
-        "\n📊 Results: {killed} killed, {survived_count} survived out of {total_testable} testable mutations"
-    );
+            // Output results summary
+            println!("{}", format_results_summary(&results));
+        }
 
-    if survived_count == 0 {
-        eprintln!("\n🎉 All mutations were killed! Your tests look solid.");
-        return Ok(());
-    }
+        Command::Apply { verbose, timeout } => {
+            init_logging(verbose);
 
-    // Step 7: Ask AI for analysis and suggestions
-    eprintln!("\n💡 Analyzing surviving mutations...\n");
+            let cwd = std::env::current_dir()?;
+            let test_timeout = Duration::from_secs_f64(timeout);
 
-    let results_summary = format_results_summary(&results);
-    let system_prompt = if config.auto_mode {
-        "Output only the updated file in the exact delimited format requested. No markdown. No explanations. No code fences."
-    } else {
-        "You are a Rust testing expert. Help improve test coverage based on mutation testing results."
-    };
-    let analysis = converse(
-        &bedrock,
-        model_id,
-        system_prompt,
-        &build_analysis_prompt(config.auto_mode, &results_summary, &file_contents),
-    )
-    .await?;
-
-    println!("{analysis}");
-
-    // Step 8: Auto-apply if requested
-    if config.auto_mode {
-        auto_apply(&cwd, &analysis, test_timeout).await?;
+            // Read analysis text from stdin
+            let analysis = read_stdin()?;
+            auto_apply(&cwd, &analysis, test_timeout).await?;
+        }
     }
 
     Ok(())
@@ -700,25 +733,6 @@ mod tests {
         let lines = vec!["a", "b"];
         assert_eq!(find_target_line(&lines, 0, "a"), None);
         assert_eq!(find_target_line(&lines, 3, "a"), None);
-    }
-
-    #[test]
-    fn test_config_defaults() {
-        let config = Config::default();
-        assert!(!config.auto_mode);
-        assert!(!config.quick_mode);
-        assert!(!config.verbose);
-    }
-
-    #[test]
-    fn test_config_model_id() {
-        let mut config = Config::default();
-        assert_eq!(config.model_id(), "us.anthropic.claude-sonnet-4-6");
-        config.quick_mode = true;
-        assert_eq!(
-            config.model_id(),
-            "us.anthropic.claude-haiku-4-5-20251001-v1:0"
-        );
     }
 
     #[test]
@@ -807,30 +821,75 @@ mod tests {
     }
 
     #[test]
-    fn test_read_all_sources_line_numbers() {
-        let temp = std::env::temp_dir().join("morris_test_lnums");
+    fn test_format_discover_output() {
+        let temp = std::env::temp_dir().join("morris_test_discover_fmt");
         let src = temp.join("src");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("lib.rs"), "line_one\nline_two\nline_three\n").unwrap();
 
         let files = list_source_files(&temp);
-        let contents = read_all_sources(&temp, &files).unwrap();
+        let output = format_discover_output(&temp, &files, 1.5, 10.0).unwrap();
 
-        assert!(
-            contents.contains("   1| line_one"),
-            "first line must be 1-based"
-        );
-        assert!(contents.contains("   2| line_two"), "second line must be 2");
-        assert!(
-            contents.contains("   3| line_three"),
-            "third line must be 3"
-        );
-        assert!(
-            !contents.contains("   0| "),
-            "must not contain 0-based numbers"
-        );
+        // YAML frontmatter
+        assert!(output.starts_with("---\n"), "must start with frontmatter");
+        assert!(output.contains("baseline_duration_secs: 1.5"));
+        assert!(output.contains("test_timeout_secs: 10.0"));
+        assert!(output.contains("  - src/lib.rs"));
+
+        // Fenced code block
+        assert!(output.contains("## src/lib.rs"));
+        assert!(output.contains("```rust"));
+
+        // Line numbers
+        assert!(output.contains("   1| line_one"), "first line must be 1-based");
+        assert!(output.contains("   2| line_two"), "second line must be 2");
+        assert!(output.contains("   3| line_three"), "third line must be 3");
 
         std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn test_parse_mutation_plan() {
+        let input = "\
+## src/lib.rs:42 Change > to >=
+-     if x > 0 {
++     if x >= 0 {
+
+## src/main.rs:10 Change + to -
+-     x + 1
++     x - 1
+";
+        let mutations = parse_mutation_plan(input).unwrap();
+        assert_eq!(mutations.len(), 2);
+        assert_eq!(mutations[0].file_path, "src/lib.rs");
+        assert_eq!(mutations[0].line_number, 42);
+        assert_eq!(mutations[0].original_line, "    if x > 0 {");
+        assert_eq!(mutations[0].mutated_line, "    if x >= 0 {");
+        assert_eq!(mutations[0].description, "Change > to >=");
+        assert_eq!(mutations[1].file_path, "src/main.rs");
+        assert_eq!(mutations[1].line_number, 10);
+    }
+
+    #[test]
+    fn test_parse_mutation_plan_skips_blanks() {
+        let input = "\
+\n\n## src/lib.rs:1 desc\n- a\n+ b\n\n";
+        let mutations = parse_mutation_plan(input).unwrap();
+        assert_eq!(mutations.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_mutation_plan_empty() {
+        assert!(parse_mutation_plan("").is_err());
+        assert!(parse_mutation_plan("just some text\n").is_err());
+    }
+
+    #[test]
+    fn test_parse_mutation_plan_incomplete() {
+        // Header without - and + lines
+        assert!(parse_mutation_plan("## src/lib.rs:1 desc\n").is_err());
+        // Header with only original, no mutated
+        assert!(parse_mutation_plan("## src/lib.rs:1 desc\n- orig\n").is_err());
     }
 
     #[test]
